@@ -10,6 +10,7 @@
 #include <QMouseEvent>
 #include <QPainter>
 #include <QPropertyAnimation>
+#include <QScreen>
 #include <QTimer>
 #include <utility>
 
@@ -32,6 +33,10 @@ SelectionWidget::SelectionWidget(QColor c, QWidget* parent)
     connect(m_animation, &QPropertyAnimation::finished, this, [this]() {
         emit geometrySettled();
     });
+
+    m_dragTimer.setSingleShot(true);
+    connect(
+      &m_dragTimer, &QTimer::timeout, this, &SelectionWidget::flushPendingDrag);
 
     int sideVal = GlobalValues::buttonBaseSize() * 0.6;
     int handleSide = sideVal / 2;
@@ -157,16 +162,56 @@ QRect SelectionWidget::rect() const
 bool SelectionWidget::eventFilter(QObject* obj, QEvent* event)
 {
     if (m_ignoreMouse && dynamic_cast<QMouseEvent*>(event)) {
+        m_dragTimer.stop();
+        m_pendingDrag.reset();
         m_activeSide = NO_SIDE;
         unsetCursor();
     } else if (event->type() == QEvent::MouseButtonRelease) {
+        flushPendingDrag();
         parentMouseReleaseEvent(static_cast<QMouseEvent*>(event));
     } else if (event->type() == QEvent::MouseButtonPress) {
+        flushPendingDrag();
         parentMousePressEvent(static_cast<QMouseEvent*>(event));
     } else if (event->type() == QEvent::MouseMove) {
-        parentMouseMoveEvent(static_cast<QMouseEvent*>(event));
+        auto* mouseEvent = static_cast<QMouseEvent*>(event);
+        if (mouseEvent->buttons() == Qt::LeftButton) {
+            throttledDragEvent(mouseEvent);
+        } else {
+            parentMouseMoveEvent(mouseEvent);
+        }
     }
     return false;
+}
+
+// Mice can report far more often than the screen refreshes, so apply at most
+// one selection change per frame and keep only the latest position in between.
+void SelectionWidget::throttledDragEvent(QMouseEvent* e)
+{
+    const qreal refreshRate = screen() ? screen()->refreshRate() : 60.0;
+    const int frameMs = qMax(1, qRound(1000.0 / qMax(refreshRate, 1.0)));
+
+    if (m_lastDragApplied.isValid() && m_lastDragApplied.elapsed() < frameMs) {
+        m_pendingDrag.reset(e->clone());
+        if (!m_dragTimer.isActive()) {
+            m_dragTimer.start(frameMs - m_lastDragApplied.elapsed());
+        }
+        return;
+    }
+
+    m_dragTimer.stop();
+    m_pendingDrag.reset();
+    m_lastDragApplied.start();
+    parentMouseMoveEvent(e);
+}
+
+void SelectionWidget::flushPendingDrag()
+{
+    m_dragTimer.stop();
+    if (m_pendingDrag) {
+        const std::unique_ptr<QMouseEvent> pending = std::move(m_pendingDrag);
+        m_lastDragApplied.start();
+        parentMouseMoveEvent(pending.get());
+    }
 }
 
 void SelectionWidget::parentMousePressEvent(QMouseEvent* e)

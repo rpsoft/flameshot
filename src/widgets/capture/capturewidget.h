@@ -219,6 +219,9 @@ private:
     // XYWH display position and timer
     bool m_xywhDisplay;
     QTimer m_xywhTimer;
+    QRect m_xywhRect;
+    QString xywhText(const QRect& selection) const;
+    QRect xywhBox(const QRect& selection);
 
     QUndoStack m_undoStack;
 

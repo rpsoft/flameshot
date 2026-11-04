@@ -100,6 +100,9 @@ CaptureWidget::CaptureWidget(const CaptureRequest& req,
     m_xywhTimer.setSingleShot(true);
     setAttribute(Qt::WA_DeleteOnClose);
     setAttribute(Qt::WA_QuitOnClose, false);
+    // paintEvent covers the whole widget with the screenshot, so filling the
+    // background first on every repaint is wasted work.
+    setAttribute(Qt::WA_OpaquePaintEvent);
     m_opacity = m_config.contrastOpacity();
     m_uiColor = m_config.uiColor();
     m_contrastUiColor = m_config.contrastUiColor();
@@ -126,6 +129,13 @@ CaptureWidget::CaptureWidget(const CaptureRequest& req,
         if (!ok) {
             // Error already logged in ScreenGrabber
             this->close();
+        }
+        // Portal screenshots can load with an alpha channel, which makes each
+        // repaint blend every pixel. A desktop capture is opaque, so drop it.
+        if (m_context.screenshot.hasAlphaChannel()) {
+            m_context.screenshot = QPixmap::fromImage(
+              m_context.screenshot.toImage().convertToFormat(
+                QImage::Format_RGB32));
         }
         m_context.origScreenshot = m_context.screenshot;
 
@@ -436,7 +446,8 @@ void CaptureWidget::handleButtonLeftClick(CaptureToolButton* b)
 void CaptureWidget::xywhTick()
 {
     m_xywhDisplay = false;
-    update();
+    update(m_xywhRect);
+    m_xywhRect = QRect();
 }
 
 void CaptureWidget::onDisplayGridChanged(bool display)
@@ -461,7 +472,12 @@ void CaptureWidget::startColorGrab()
 void CaptureWidget::showxywh()
 {
     m_xywhDisplay = true;
-    update();
+    // Only repaint the indicator: this runs on every selection change, and a
+    // full window repaint each time overloads the compositor on large screens.
+    const QRect box = xywhBox(m_selection->geometry().normalized());
+    update(m_xywhRect);
+    update(box);
+    m_xywhRect = box;
     int timeout = m_config.showSelectionGeometryHideTime();
     if (timeout != 0) {
         m_xywhTimer.start(timeout);
@@ -657,6 +673,51 @@ void CaptureWidget::closeEvent(QCloseEvent* event)
     QWidget::closeEvent(event);
 }
 
+QString CaptureWidget::xywhText(const QRect& selection) const
+{
+    const qreal scale = m_context.screenshot.devicePixelRatio();
+    return QString("%1x%2+%3+%4")
+      .arg(QString::number(static_cast<int>(selection.width() * scale)),
+           QString::number(static_cast<int>(selection.height() * scale)),
+           QString::number(static_cast<int>(selection.left() * scale)),
+           QString::number(static_cast<int>(selection.top() * scale)));
+}
+
+QRect CaptureWidget::xywhBox(const QRect& selection)
+{
+    QRect xybox = fontMetrics().boundingRect(xywhText(selection));
+    // the small numbers here are just margins so the text doesn't
+    // smack right up to the box; they aren't critical and the box
+    // size itself is tied to the font metrics
+    xybox.adjust(0, 0, 10, 12);
+    int x0, y0;
+
+    switch (static_cast<GeneralConf::xywh_position>(
+      m_config.showSelectionGeometry())) {
+        case GeneralConf::xywh_top_left:
+            x0 = selection.left();
+            y0 = selection.top();
+            break;
+        case GeneralConf::xywh_bottom_left:
+            x0 = selection.left();
+            y0 = selection.bottom() - xybox.height();
+            break;
+        case GeneralConf::xywh_top_right:
+            x0 = selection.right() - xybox.width();
+            y0 = selection.top();
+            break;
+        case GeneralConf::xywh_bottom_right:
+            x0 = selection.right() - xybox.width();
+            y0 = selection.bottom() - xybox.height();
+            break;
+        case GeneralConf::xywh_center:
+        default:
+            x0 = selection.left() + (selection.width() - xybox.width()) / 2;
+            y0 = selection.top() + (selection.height() - xybox.height()) / 2;
+    }
+    return QRect(x0, y0, xybox.width(), xybox.height());
+}
+
 void CaptureWidget::paintEvent(QPaintEvent* paintEvent)
 {
     Q_UNUSED(paintEvent)
@@ -664,8 +725,6 @@ void CaptureWidget::paintEvent(QPaintEvent* paintEvent)
     if (!painter.isActive()) {
         return;
     }
-    GeneralConf::xywh_position position =
-      static_cast<GeneralConf::xywh_position>(m_config.showSelectionGeometry());
     /* QPainter::save and restore is somewhat costly so we try to guess
        if we need to do it here. What that means is that if you add
        anything to the paintEvent and want to save/restore you should
@@ -684,63 +743,16 @@ void CaptureWidget::paintEvent(QPaintEvent* paintEvent)
     }
     painter.drawPixmap(0, 0, m_context.screenshot);
     if (m_selection && m_xywhDisplay) {
-        const QRect& selection = m_selection->geometry().normalized();
-        const qreal scale = m_context.screenshot.devicePixelRatio();
-        QRect xybox;
-        QFontMetrics fm = painter.fontMetrics();
-
-        QString xy =
-          QString("%1x%2+%3+%4")
-            .arg(QString::number(static_cast<int>(selection.width() * scale)),
-                 QString::number(static_cast<int>(selection.height() * scale)),
-                 QString::number(static_cast<int>(selection.left() * scale)),
-                 QString::number(static_cast<int>(selection.top() * scale)));
-
-        xybox = fm.boundingRect(xy);
-        // the small numbers here are just margins so the text doesn't
-        // smack right up to the box; they aren't critical and the box
-        // size itself is tied to the font metrics
-        xybox.adjust(0, 0, 10, 12);
-        // in anticipation of making the position adjustable
-        int x0, y0;
-        // Move these to header
-
-        switch (position) {
-            case GeneralConf::xywh_top_left:
-                x0 = selection.left();
-                y0 = selection.top();
-                break;
-            case GeneralConf::xywh_bottom_left:
-                x0 = selection.left();
-                y0 = selection.bottom() - xybox.height();
-                break;
-            case GeneralConf::xywh_top_right:
-                x0 = selection.right() - xybox.width();
-                y0 = selection.top();
-                break;
-            case GeneralConf::xywh_bottom_right:
-                x0 = selection.right() - xybox.width();
-                y0 = selection.bottom() - xybox.height();
-                break;
-            case GeneralConf::xywh_center:
-            default:
-                x0 = selection.left() + (selection.width() - xybox.width()) / 2;
-                y0 =
-                  selection.top() + (selection.height() - xybox.height()) / 2;
-        }
+        const QRect selection = m_selection->geometry().normalized();
+        const QRect xybox = xywhBox(selection);
 
         QColor uicolor = ConfigHandler().uiColor();
         uicolor.setAlpha(200);
-        painter.fillRect(
-          x0, y0, xybox.width(), xybox.height(), QBrush(uicolor));
+        painter.fillRect(xybox, QBrush(uicolor));
         painter.setPen(ColorUtils::colorIsDark(uicolor) ? Qt::white
                                                         : Qt::black);
-        painter.drawText(x0,
-                         y0,
-                         xybox.width(),
-                         xybox.height(),
-                         Qt::AlignVCenter | Qt::AlignHCenter,
-                         xy);
+        painter.drawText(
+          xybox, Qt::AlignVCenter | Qt::AlignHCenter, xywhText(selection));
     }
 
     if (m_displayGrid) {

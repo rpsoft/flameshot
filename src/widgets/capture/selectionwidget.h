@@ -3,7 +3,11 @@
 
 #pragma once
 
+#include <QElapsedTimer>
+#include <QMouseEvent>
+#include <QTimer>
 #include <QWidget>
+#include <memory>
 
 class QPropertyAnimation;
 
@@ -45,6 +49,8 @@ protected:
     void parentMousePressEvent(QMouseEvent* e);
     void parentMouseReleaseEvent(QMouseEvent* e);
     void parentMouseMoveEvent(QMouseEvent* e);
+    void throttledDragEvent(QMouseEvent* e);
+    void flushPendingDrag();
 
     void paintEvent(QPaintEvent*) override;
     void resizeEvent(QResizeEvent*) override;
@@ -89,6 +95,9 @@ private:
     QPoint m_handleOffset;
 
     QPoint m_dragStartPos;
+    std::unique_ptr<QMouseEvent> m_pendingDrag;
+    QTimer m_dragTimer;
+    QElapsedTimer m_lastDragApplied;
     SideType m_activeSide;
     QCursor m_idleCentralCursor;
     bool m_ignoreMouse;
