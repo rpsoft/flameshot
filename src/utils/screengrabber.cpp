@@ -10,6 +10,7 @@
 #include <QEventLoop>
 #include <QGuiApplication>
 #include <QHBoxLayout>
+#include <QHash>
 #include <QImageReader>
 #include <QKeyEvent>
 #include <QLabel>
@@ -20,6 +21,7 @@
 #include <QScreen>
 #include <QTimer>
 #include <QWidget>
+#include <QWindow>
 #include <algorithm>
 
 #ifdef FLAMESHOT_DEBUG_CAPTURE
@@ -37,6 +39,39 @@
 #endif
 
 bool ScreenGrabber::m_monitorSelectionActive = false;
+
+namespace {
+// Reports which probe window the pointer is over, see
+// ScreenGrabber::probeActiveScreenGnomeWayland().
+class PointerProbeFilter : public QObject
+{
+public:
+    PointerProbeFilter(QHash<QObject*, QScreen*>& probes, QEventLoop& loop)
+      : m_probes(probes)
+      , m_loop(loop)
+    {}
+
+    QScreen* hitScreen() const { return m_hitScreen; }
+
+protected:
+    bool eventFilter(QObject* obj, QEvent* event) override
+    {
+        if (m_hitScreen == nullptr && (event->type() == QEvent::Enter ||
+                                       event->type() == QEvent::MouseMove)) {
+            m_hitScreen = m_probes.value(obj, nullptr);
+            if (m_hitScreen != nullptr) {
+                m_loop.quit();
+            }
+        }
+        return QObject::eventFilter(obj, event);
+    }
+
+private:
+    QHash<QObject*, QScreen*>& m_probes;
+    QEventLoop& m_loop;
+    QScreen* m_hitScreen = nullptr;
+};
+} // namespace
 
 ScreenGrabber::ScreenGrabber(QObject* parent)
   : QObject(parent)
@@ -228,6 +263,50 @@ QPixmap ScreenGrabber::unixScreenshot(bool& ok)
 #endif
 }
 
+// Wayland gives clients no global pointer position, and GNOME Shell does not
+// expose it over D-Bus. Briefly cover each screen with an invisible fullscreen
+// window: the compositor sends a pointer enter event to the one under the
+// pointer, even if the pointer is not moving. Returns nullptr on timeout.
+QScreen* ScreenGrabber::probeActiveScreenGnomeWayland()
+{
+    QEventLoop loop;
+    QHash<QObject*, QScreen*> probes;
+    PointerProbeFilter filter(probes, loop);
+    QList<QWidget*> windows;
+
+    for (QScreen* screen : QGuiApplication::screens()) {
+        auto* window =
+          new QWidget(nullptr, Qt::Window | Qt::FramelessWindowHint);
+        window->setAttribute(Qt::WA_TranslucentBackground);
+        window->setMouseTracking(true);
+        window->setScreen(screen);
+        window->setGeometry(screen->geometry());
+        window->winId(); // Creates the QWindow so it can be filtered too
+        probes.insert(window, screen);
+        probes.insert(window->windowHandle(), screen);
+        window->installEventFilter(&filter);
+        window->windowHandle()->installEventFilter(&filter);
+        windows.append(window);
+    }
+
+    QTimer timeout;
+    timeout.setSingleShot(true);
+    QObject::connect(&timeout, &QTimer::timeout, &loop, &QEventLoop::quit);
+    timeout.start(1000);
+
+    for (QWidget* window : windows) {
+        window->showFullScreen();
+    }
+    loop.exec();
+
+    for (QWidget* window : windows) {
+        window->hide();
+    }
+    qDeleteAll(windows);
+
+    return filter.hitScreen();
+}
+
 QPixmap ScreenGrabber::selectMonitorAndCrop(const QPixmap& fullScreenshot,
                                             bool& ok)
 {
@@ -244,32 +323,44 @@ QPixmap ScreenGrabber::selectMonitorAndCrop(const QPixmap& fullScreenshot,
         return cropToMonitor(fullScreenshot, 0);
     }
 
-    // Capture Active Monitor: auto-select monitor under cursor
-    if (ConfigHandler().captureActiveMonitor()) {
-        if (m_info.waylandDetected()) {
-            AbstractLogger::error()
-              << tr("Capture Active Monitor is not supported on Wayland due to "
-                    "Wayland security model.");
-            ok = false;
-            return QPixmap();
-        }
-
-        QGuiAppCurrentScreen screenFinder;
-        QScreen* cursorScreen = screenFinder.currentScreen();
-        int monitorIndex = screens.indexOf(cursorScreen);
-        if (monitorIndex >= 0) {
-            m_selectedMonitor = monitorIndex;
-            return cropToMonitor(fullScreenshot, monitorIndex);
-        }
-        // Fall through to manual selection if screen lookup fails
-    }
-
     if (m_monitorSelectionActive) {
         AbstractLogger::error()
           << tr("Screenshot already in progress, please wait for the current "
                 "screenshot to complete");
         ok = false;
         return QPixmap();
+    }
+
+    // Capture Active Monitor: auto-select monitor under cursor
+    if (ConfigHandler().captureActiveMonitor()) {
+        QScreen* cursorScreen = nullptr;
+        if (m_info.waylandDetected()) {
+            if (m_info.windowManager() != DesktopInfo::GNOME ||
+                QGuiApplication::platformName() != QLatin1String("wayland")) {
+                AbstractLogger::error()
+                  << tr("Capture Active Monitor is only supported on Wayland "
+                        "when running natively on GNOME.");
+                ok = false;
+                return QPixmap();
+            }
+            m_monitorSelectionActive = true;
+            cursorScreen = probeActiveScreenGnomeWayland();
+            m_monitorSelectionActive = false;
+            if (cursorScreen == nullptr) {
+                AbstractLogger::warning()
+                  << tr("Could not detect the active monitor");
+            }
+        } else {
+            QGuiAppCurrentScreen screenFinder;
+            cursorScreen = screenFinder.currentScreen();
+        }
+
+        int monitorIndex = screens.indexOf(cursorScreen);
+        if (monitorIndex >= 0) {
+            m_selectedMonitor = monitorIndex;
+            return cropToMonitor(fullScreenshot, monitorIndex);
+        }
+        // Fall through to manual selection if screen lookup fails
     }
 
     m_monitorSelectionActive = true;
