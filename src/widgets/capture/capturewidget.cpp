@@ -887,7 +887,9 @@ int CaptureWidget::selectToolItemAtPos(const QPoint& pos)
 
 void CaptureWidget::mousePressEvent(QMouseEvent* e)
 {
-    activateWindow();
+    if (!isActiveWindow()) {
+        activateWindow();
+    }
     m_startMove = false;
     m_startMovePos = QPoint();
     m_mousePressedPos = e->pos();

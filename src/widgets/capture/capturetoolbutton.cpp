@@ -94,7 +94,12 @@ QIcon CaptureToolButton::icon() const
 
 void CaptureToolButton::mousePressEvent(QMouseEvent* e)
 {
-    activateWindow();
+    // On Wayland this requests an activation token. If a tool such as Copy then
+    // closes the window before the token arrives, the compositor keeps showing
+    // a busy cursor until the token times out.
+    if (!isActiveWindow()) {
+        activateWindow();
+    }
     if (e->button() == Qt::LeftButton) {
         emit pressedButtonLeftClick(this);
         emit pressed();
